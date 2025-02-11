@@ -26,8 +26,8 @@ type Commit struct {
 
 // RepoCoverage stores repo name and its coverage percentage
 type RepoCoverage struct {
-	Name      string
-	Coverage  float64
+	Name       string
+	Coverage   float64
 	Configured bool
 }
 
