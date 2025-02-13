@@ -10,16 +10,15 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/google/go-github/v53/github"
 	"golang.org/x/oauth2"
 )
 
-// Codecov API base URL
 const codecovAPIBase = "https://codecov.io/api/v2/github"
 
-// Structs for detailed file coverage report
 type FileCoverage struct {
 	Name   string `json:"name"`
 	Totals struct {
@@ -37,14 +36,12 @@ type CodecovReport struct {
 	Files []FileCoverage `json:"files"`
 }
 
-// RepoCoverage stores repo name and its coverage percentage
 type RepoCoverage struct {
 	Name       string
 	Coverage   float64
 	Configured bool
 }
 
-// Fetch all repositories using pagination
 func getAllRepos(org, githubToken string) ([]string, error) {
 	ctx := context.Background()
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: githubToken})
@@ -74,7 +71,6 @@ func getAllRepos(org, githubToken string) ([]string, error) {
 	return allRepos, nil
 }
 
-// Fetch latest commit test coverage for a repository
 func getRepoCoverage(org, repo, token string) (float64, bool) {
 	url := fmt.Sprintf("%s/%s/repos/%s/commits", codecovAPIBase, org, repo)
 
@@ -106,7 +102,6 @@ func getRepoCoverage(org, repo, token string) (float64, bool) {
 	return data.Results[0].Totals.Coverage, true
 }
 
-// Fetch detailed code coverage report
 func getDetailedCoverageReport(org, repo, token string) (*CodecovReport, error) {
 	url := fmt.Sprintf("https://api.codecov.io/api/v2/gh/%s/repos/%s/report", org, repo)
 
@@ -128,12 +123,11 @@ func getDetailedCoverageReport(org, repo, token string) (*CodecovReport, error) 
 	return &report, nil
 }
 
-// Generate a CSV file for detailed coverage
 func generateCSVReport(repo string, report *CodecovReport) error {
 	filename := fmt.Sprintf("detailed_%s_coverage_report.csv", repo)
 	file, err := os.Create(filename)
 	if err != nil {
-		fmt.Printf("❌ Error writing report for %s: %v\n", repo, err)
+		fmt.Printf("Error writing report for %s: %v\n", repo, err)
 		return err
 	}
 	defer file.Close()
@@ -141,15 +135,12 @@ func generateCSVReport(repo string, report *CodecovReport) error {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// Write CSV headers
 	writer.Write([]string{"File", "Total Lines", "Covered Lines", "Missed Lines", "Coverage %"})
 
-	// Sort files by lowest coverage (ascending order)
 	sort.Slice(report.Files, func(i, j int) bool {
 		return report.Files[i].Totals.Coverage < report.Files[j].Totals.Coverage
 	})
 
-	// Write data
 	for _, file := range report.Files {
 		writer.Write([]string{
 			file.Name,
@@ -160,70 +151,72 @@ func generateCSVReport(repo string, report *CodecovReport) error {
 		})
 	}
 
-	fmt.Printf("✅ Detailed coverage report generated for %s: %s\n", repo, filename)
+	fmt.Printf("Detailed coverage report generated for %s: %s\n", repo, filename)
 	return nil
 }
 
 func main() {
-	// Parse flags
 	verbose := flag.Bool("v", false, "Enable verbose mode to generate detailed coverage reports")
 	flag.Parse()
 
-	org := "openshift" // Organization name
+	org := "openshift"
 
-	// Get API tokens from environment variables
 	githubToken := os.Getenv("GITHUB_TOKEN")
 	if githubToken == "" {
-		log.Fatal("❌ Please set the GITHUB_TOKEN environment variable")
+		log.Fatal("Please set the GITHUB_TOKEN environment variable")
 	}
 
 	codecovToken := os.Getenv("CODECOV_TOKEN")
 	if codecovToken == "" {
-		log.Fatal("❌ Please set the CODECOV_TOKEN environment variable")
+		log.Fatal("Please set the CODECOV_TOKEN environment variable")
 	}
 
-	// Fetch all repositories
 	repos, err := getAllRepos(org, githubToken)
 	if err != nil {
-		log.Fatalf("❌ Error getting repositories: %v", err)
+		log.Fatalf("Error getting repositories: %v", err)
 	}
 
-	// Store coverage details
 	var coveredRepos []RepoCoverage
 	var notConfiguredRepos []RepoCoverage
+	var mu sync.Mutex
 
-	// Fetch coverage for each repository
+	var wg sync.WaitGroup
+
 	for _, repo := range repos {
-		coverage, configured := getRepoCoverage(org, repo, codecovToken)
-		if configured {
-			coveredRepos = append(coveredRepos, RepoCoverage{Name: repo, Coverage: coverage, Configured: true})
-		} else {
-			notConfiguredRepos = append(notConfiguredRepos, RepoCoverage{Name: repo, Coverage: 0, Configured: false})
-		}
+		wg.Add(1)
+		go func(repo string) {
+			defer wg.Done()
+			coverage, configured := getRepoCoverage(org, repo, codecovToken)
+			mu.Lock()
+			defer mu.Unlock()
+
+			if configured {
+				coveredRepos = append(coveredRepos, RepoCoverage{Name: repo, Coverage: coverage, Configured: true})
+			} else {
+				notConfiguredRepos = append(notConfiguredRepos, RepoCoverage{Name: repo, Coverage: 0, Configured: false})
+			}
+
+			if *verbose && configured {
+				report, err := getDetailedCoverageReport(org, repo, codecovToken)
+				if err == nil {
+					_ = generateCSVReport(repo, report)
+				}
+			}
+		}(repo)
 	}
 
-	// Sort repositories by coverage percentage (ascending order)
+	wg.Wait()
+
 	sort.Slice(coveredRepos, func(i, j int) bool {
 		return coveredRepos[i].Coverage < coveredRepos[j].Coverage
 	})
 
-	// Print CSV headers
 	fmt.Println("Repository, Coverage Percentage")
 
-	// Print repositories with coverage first (sorted in ascending order)
 	for _, repo := range coveredRepos {
 		fmt.Printf("%s, %.2f%%\n", repo.Name, repo.Coverage)
-
-		// Generate detailed CSV report if verbose mode is enabled
-		if *verbose {
-			report, err := getDetailedCoverageReport(org, repo.Name, codecovToken)
-			if err == nil {
-				_ = generateCSVReport(repo.Name, report)
-			}
-		}
 	}
 
-	// Print repositories without coverage
 	for _, repo := range notConfiguredRepos {
 		fmt.Printf("%s, Not Configured\n", repo.Name)
 	}
